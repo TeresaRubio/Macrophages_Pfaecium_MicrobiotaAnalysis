@@ -1,0 +1,827 @@
+---
+title: "Macrofagos - P_faecium"
+author: "Teresa Rubio"
+date: "July, 2022"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, eval=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Obtain ASVs with DADA2
+General considerations:
+Maintain at least 10% of raw reads after all filtration steps (filterAndTrim as well as downstream merging).
+Use maxEE as the primary filtering parameter. Values from 2 to 6 are shown in various issues.
+Run a subset of samples through the entire pipeline to determine if full pipeline produces too few features.
+60% of reads passing filterAndTrim is good.
+For merging reads, don't go below 8 nucleotide overlap.
+Chimeras as a percentage of sequences should be less than 30% generally.
+
+## Packages and project name
+```{r}
+library(dada2)
+library(openxlsx)
+library(ggpubr)
+library(writexl)
+library(ggplot2)
+library(DECIPHER)
+library(phangorn)
+library(phyloseq); packageVersion("phyloseq")
+library(Biostrings); packageVersion("Biostrings")
+library(readxl)
+```
+
+## Load data
+```{r eval=FALSE}
+path <- "~/DATOS/2022-07-18_Macrofagos-P_faecium/" # CHANGE ME to the directory containing the fastq files.
+setwd(path)
+
+# Sort ensures forward/reverse reads are in same order
+fnFs <- sort(list.files("reads", pattern="_R1_001.fastq"))
+fnRs <- sort(list.files("reads", pattern="_R2_001.fastq"))
+
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(fnFs, "_"), `[`, 1)
+sample.names <- sapply(strsplit(sample.names, "-"), `[`, 4)
+
+# Specify the full path to the fnFs and fnRs
+fnFs <- file.path("reads", fnFs)
+fnRs <- file.path("reads", fnRs)
+```
+
+## Examine quality profiles of forward and reverse reads
+It is important to look at your data. We generally advise trimming the last few nucleotides to avoid less well-controlled errors that can arise there. .
+
+We start by visualizing the quality profiles of the forward reads:
+```{r eval=FALSE}
+plotQualityProfile(fnFs[1:6])
+```
+In gray-scale is a heat map of the frequency of each quality score at each base position. The mean quality score at each position is shown by the green line, and the quartiles of the quality score distribution by the orange lines. The red line shows the scaled proportion of reads that extend to at least that position (this is more useful for other sequencing technologies, as Illumina reads are typically all the same length, hence the flat red line).
+
+
+Now we visualize the quality profile of the reverse reads:
+```{r eval=FALSE}
+plotQualityProfile(fnRs[1:6])
+```
+The reverse reads are of significantly worse quality, especially at the end, which is common in Illumina sequencing. This isn’t too worrisome, as DADA2 incorporates quality information into its error model which makes the algorithm robust to lower quality sequence, but trimming as the average qualities crash will improve the algorithm’s sensitivity to rare sequence variants.
+
+
+## Perform filtering and trimming
+We define the filenames for the filtered fastq files:
+```{r eval=FALSE}
+filt_path <- file.path("Analysis_results", "01_filtered") # Place filtered files in filtered/ subdirectory
+filtFs <- file.path(filt_path, paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(filt_path, paste0(sample.names, "_R_filt.fastq.gz"))
+```
+
+Finally, we'll use standard filtering parameters: maxN=0 (DADA2 requires no Ns), truncQ=2, rm.phix=TRUE and maxEE=2,5. The maxEE parameter sets the maximum number of "expected errors" allowed in a read, which is a better filter than simply averaging quality scores.
+
+Filter the forward and reverse reads. Since DADA2 does incorporate sequence quality it isn't bothered much by lower quality sequences, and simply relaxing the maxEE filter is the recommended way to expand the number of output reads.
+We generally advise trimming the last few nucleotides to avoid less well-controlled errors that can arise there. 
+
+```{r eval=FALSE}
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(250,250), trimLeft = c(30,30), maxN=0, maxEE=c(2,5), truncQ=2, rm.phix=TRUE, compress=TRUE, multithread=TRUE) # On Windows set multithread=FALSE
+mytable2 <- cbind(out, read.loosed = (out[,1] - out[,2]) / out[,1] *100)
+
+# openxlsx::write.xlsx(data.frame(mytable2), file = "Analysis_results/01_filtered/out_filtered.xlsx", rowNames = T, overwrite = T)
+# save(out, file = "Analysis_results/01_filtered/out_filtered.Rda")
+```
+60% of reads passing filterAndTrim is good
+
+
+## Learn the Error Rates
+The DADA2 method relies on a parameterized model of substitution errors to distinguish sequencing errors from real biological variation. Because error rates can (and often do) vary substantially between sequencing runs and PCR protocols, the model parameters can be discovered from the data itself using a form of unsupervised learning in which sample inference is alternated with parameter estimation until both are jointly consistent.As in many optimization problems, the algorithm must begin with an initial guess, for which the maximum possible error rates in this data are used (the error rates if only the most abundant sequence is correct and all the rest are errors).
+
+Parameter learning is computationally intensive, as it requires multiple iterations of the sequence inference algorithm, and therefore it is often useful to estimate the error rates from a (sufficiently large) subset of the data.
+```{r eval=FALSE}
+errF <- learnErrors(filtFs, multithread=TRUE)
+errR <- learnErrors(filtRs, multithread=TRUE)
+
+dir.create("Analysis_results/02_dada")
+save(errF, file = "Analysis_results/02_dada/01_errF.Rda")
+save(errR, file = "Analysis_results/02_dada/01_errR.Rda")
+```
+
+```{r eval=FALSE}
+png(filename = "Analysis_results/02_dada/01_errF.png")
+plotErrors(errF, nominalQ=TRUE)
+dev.off()
+
+png(filename = "Analysis_results/02_dada/01_errR.png")
+plotErrors(errR, nominalQ=TRUE)
+dev.off()
+```
+
+The error rates for each possible transition (eg. A->C, A->G, .) are shown. Points are the observed error rates for each consensus quality score. The black line shows the estimated error rates after convergence. The red line shows the error rates expected under the nominal definition of the Q-value. In order to verify that the error rates have been reasonably well-estimated, we inspect the fit between the observed error rates (black points) and the fitted error rates (black lines). Parameter learning is computationally intensive, so by default the learnErrors function uses only a subset of the data (the first 1M reads). If the plotted error model does not look like a good fit, try increasing the nreads parameter to see if the fit improves.
+
+## Dereplication
+For big datasets to save RAM after (AFTER LEARN ERRORS)
+```{r eval=FALSE}
+mergers <- vector("list", length(sample.names))
+dadaF <- vector("list", length(sample.names))
+dadaR <- vector("list", length(sample.names))
+names(mergers) <- sample.names
+names(dadaF) <- sample.names
+names(dadaR) <- sample.names
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+for(sam in sample.names){
+  cat("Processing:", sam, "\n")
+  
+  #Dereplication
+  derepF <- derepFastq(filtFs[[sam]], verbose=TRUE)
+  derepR <- derepFastq(filtRs[[sam]], verbose=TRUE)
+  dadaF[[sam]] <- dada(derepF, err=errF, multithread=TRUE)
+  dadaR[[sam]] <- dada(derepR, err=errR, multithread=TRUE)
+  mergers[[sam]] <- mergePairs(dadaF[[sam]], derepF, dadaR[[sam]], derepR, verbose=TRUE)
+}
+
+head(mergers[[1]])
+```
+
+```{r eval=FALSE}
+save(derepF, file = "Analysis_results/02_dada/02_derepF.Rda")
+save(derepR, file = "Analysis_results/02_dada/02_derepR.Rda")
+save(dadaF, file = "Analysis_results/02_dada/02_dadaF.Rda")
+save(dadaR, file = "Analysis_results/02_dada/02_dadaR.Rda")
+save(mergers, file = "Analysis_results/02_dada/02_mergers.Rda")
+```
+
+
+## Construct sequence table
+The DADA2 method produces a sequence table that is a higher-resolution analogue of the common "OTU table", i.e. a sample by sequence feature table valued by the number of times each sequence was observed in each sample.
+```{r eval=FALSE}
+# Construct sequence table and write to disk
+seqtab <- makeSequenceTable(mergers)
+saveRDS(seqtab, "Analysis_results/02_dada/03_seqtab.rds")
+seqtab <- readRDS("Analysis_results/02_dada/03_seqtab.rds")
+
+## The sequences being tabled vary in length.
+dim(seqtab)
+
+# Inspect distribution of sequence lengths
+plot(table(nchar(getSequences(seqtab))))
+
+#Sequences that are much longer or shorter than expected may be the result of non-specific priming, and may be worth removing 
+seqtab <- seqtab[,nchar(colnames(seqtab)) %in% seq(370,420)] #This is analogous to "cutting a band" in-silico to get amplicons of the targeted length.
+```
+The sequence table is a matrix with rows corresponding to (and named by) the samples, and columns corresponding to (and named by) the sequence variants. Check that the lengths of the merged sequences all fall within the expected range for the V4 amplicon.
+Sequences that are much longer or shorter than expected may be the result of non-specific priming, and may be worth removing (eg. seqtab2 <- seqtab[,nchar(colnames(seqtab)) %in% seq(250,256)]). This is analogous to "cutting a band" in-silico to get amplicons of the targeted length.
+
+
+## Remove chimeras
+The core dada method removes substitution and indel errors, but chimeras remain. We now remove chimeric sequences by comparing each inferred sequence to the others in the table, and removing those that can be reproduced by stitching together two more abundant sequences. Fortunately, the accuracy of the sequences after denoising makes identifying chimeras simpler than it is when dealing with fuzzy OTUs: all sequences which can be exactly reconstructed as a bimera (two-parent chimera) from more abundant sequences.
+
+Remove chimeric sequences:
+```{r eval=FALSE}
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+
+dim(seqtab.nochim)
+
+sum(seqtab.nochim)/sum(seqtab)
+
+#Save as text file
+save(seqtab.nochim,file = "Analysis_results/02_dada/04_out_chimeras.rda")
+write.table(seqtab.nochim,"Analysis_results/02_dada/04_out_chimeras.txt",sep="\t")
+#seqtab.nochim<-as.matrix(read.table("Analysis_results/02_dada/04_out_chimeras.txt",sep="\t"))
+```
+
+## Track reads
+```{r eval=FALSE}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out,
+               sapply(dadaF, getN),
+               sapply(dadaR, getN), 
+               sapply(mergers, getN),
+               rowSums(seqtab),
+               rowSums(seqtab.nochim)) 
+ 
+
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "seqtab", "nochim")
+head(track)
+
+write.table(track, "Analysis_results/02_dada/05_progress_dada2.txt", sep = "\t")
+save.image(file.path(path, "Analysis_results/02_dada/05_dada2_16S.RData"))
+```
+
+
+## Asign Taxonomy
+The DADA2 package provides a native implementation of the naive Bayesian classifier method for this purpose. The assignTaxonomy function takes as input a set of sequences to be classified and a training set of reference sequences with known taxonomy, and outputs taxonomic assignments with at least minBoot bootstrap confidence.
+
+We maintain formatted training fastas for the RDP training set, GreenGenes clustered at 97% identity, and the Silva reference database, and additional trainings fastas suitable for protists and certain specific environments have been contributed. For fungal taxonomy, the General Fasta release files from the UNITE ITS database can be used as is. To follow along, download the silva_nr_v132_train_set.fa.gz file, and place it in the directory with the fastq files.
+
+Extensions: The dada2 package also implements a method to make species level assignments based on exact matching between ASVs and sequenced reference strains. Recent analysis suggests that exact matching (or 100% identity) is the only appropriate way to assign species to 16S gene fragments. Currently, species-assignment training fastas are available for the Silva and RDP 16S databases. To follow the optional species addition step, download the silva_species_assignment_v132.fa.gz file, and place it in the directory with the fastq files.
+
+```{r eval=FALSE}
+# dir.create("../Databases/")
+# download.file(url = "https://zenodo.org/record/4587955/files/silva_nr99_v138.1_train_set.fa.gz?download=1", destfile = file.path(path, "../Databases/silva_nr99_v138.1_train_set.fa.gz"))
+# download.file(url = "https://zenodo.org/record/4587955/files/silva_species_assignment_v138.1.fa.gz?download=1", destfile = file.path(path, "../Databases/silva_species_assignment_v138.1.fa.gz"))
+
+set.seed(100)
+taxa <- assignTaxonomy(seqtab.nochim, refFasta = "../Databases/silva_nr99_v138.1_train_set.fa.gz", multithread=TRUE)
+taxasp <- addSpecies(taxa, "../Databases/silva_species_assignment_v138.1.fa.gz")
+unname(head(taxasp))
+
+write.table(taxasp,"Analysis_results/02_dada/06_out_taxasp.txt",sep="\t")
+save(taxasp, file = "Analysis_results/02_dada/06_out_taxasp.Rda")
+#taxasp <- read.table("Analysis_results/02_dada/06_out_taxasp.txt",sep="\t")
+```
+
+## Construc OTU table
+```{r eval=FALSE, include=FALSE}
+otutab <- as.data.frame(t(seqtab.nochim))
+
+taxatab <- as.data.frame(taxasp)
+
+otutable <- cbind(otutab,taxatab)
+
+write.table(otutable, "Analysis_results/02_dada/07_otutableDADA2.txt",sep="\t")
+#otutable <- read.table("Analysis_results/02_dada/07_otutableDADA2.txt",sep="\t")
+
+```
+
+## Filogenetic tree
+```{r eval=FALSE}
+# Sequence alignment
+seqs <- getSequences(seqtab.nochim)
+names(seqs) <- seqs
+alignment <- DECIPHER::AlignSeqs(DNAStringSet(seqs), anchor=NA,verbose=FALSE)
+dir.create("Analysis_results/03_phylogenetictree")
+save(alignment, file = "Analysis_results/03_phylogenetictree/01_alignment.rda")
+
+#Y con ese alineamiento inferimos un árbol de partida o starting tree para inicializar la búsqueda por ML
+phangAlign <- phangorn::phyDat(as(alignment, "matrix"), type="DNA")
+dm <- dist.ml(phangAlign)
+treeNJ <- NJ(dm)
+fit = pml(treeNJ, data=phangAlign)
+#update es una funcion de base que cambia los parametros k e inv del objeto anterior. La k es gamma (en filogenética) y necesitamos k=4 para el modelo GTR. inv son % de sitios invaribles.
+fitGTR <- update(fit, k=4, inv=0.2) 
+#GTR es un modelo de sustitución nucleotídica necesario para generar el árbol
+fitGTR <- optim.pml(fitGTR, model="GTR", optInv=TRUE, optGamma=TRUE,
+        rearrangement = "stochastic", control = pml.control(trace = 0))
+
+save(fitGTR, file = "Analysis_results/03_phylogenetictree/02_tree_fitGTR.rda")
+# load("Analysis_results/03_phylogenetictree/02_tree_fitGTR.rda", verbose = T)
+```
+
+
+# Construct phyloseq object (straightforward from dada2 outputs)
+```{r eval=FALSE, include=FALSE}
+samdf <- read_excel("Sequencing16s.xlsx")
+samdf <- data.frame(samdf, check.names = F)
+samdf <- samdf[!is.na(samdf$`ID mice`),]
+rownames(samdf) <- sub(".*\\-", "", samdf$Sample)
+
+#requirements to phyloseq
+seqtab.nochim <- seqtab.nochim[rownames(samdf),]
+taxasp <- as.matrix(taxasp)
+
+#pyloseq
+phyloseq_rawdata <- phyloseq(otu_table(t(seqtab.nochim), taxa_are_rows=TRUE),
+               sample_data(samdf),
+               tax_table(taxasp),
+               phy_tree(fitGTR$tree))
+
+dna <- Biostrings::DNAStringSet(taxa_names(phyloseq_rawdata))
+names(dna) <- taxa_names(phyloseq_rawdata)
+phyloseq_rawdata <- merge_phyloseq(phyloseq_rawdata, dna)
+taxa_names(phyloseq_rawdata) <- paste0("ASV", seq(ntaxa(phyloseq_rawdata)))
+names(dna) <- taxa_names(phyloseq_rawdata)
+phyloseq_rawdata
+
+dir.create("Analysis_results/04_phyloseq")
+Biostrings::writeXStringSet(dna,  file = "Analysis_results/04_phyloseq/00_rep_seqs.fasta", format = "fasta")
+
+#save ASV table
+ASV_tab <- as.data.frame(otu_table(phyloseq_rawdata))
+write.table(ASV_tab, "Analysis_results/ASV_otutable_DADA2.txt", sep="\t")
+#save taxonomy table
+tax_tab <- as.data.frame(tax_table(phyloseq_rawdata))
+write.table(tax_tab, "Analysis_results/ASV_taxtable_DADA2.txt", sep="\t")
+#save ASV+taxonomy table
+ASV_tab_tax <- cbind(ASV_tab,tax_tab)
+write.table(ASV_tab_tax, "Analysis_results/ASV_otu-taxa_table_DADA2.txt", sep="\t")
+
+save(phyloseq_rawdata, file = "Analysis_results/04_phyloseq/01_phyloseqobject_rawdata.Rda")
+```
+
+
+## Rarefaction curves
+```{r eval=FALSE}
+library(ggplot2)
+library(vegan)
+
+tiff("Analysis_results/05_analysis1/00_plot_rarecurve.tiff", width = 15, height = 15, units = "cm", res = 300)
+rarecurve(t(otu_table(phyloseq_rawdata)),
+          step = 100,
+          sample = 20000,
+          col = "blue",
+          cex = 0.75,
+          main = "Rarefaction curve")
+dev.off()
+```
+
+## Prevalence
+Filtrar taxa de baja prevalencia estableciendo un umbral y luego visulizar el efecto de manera grafica. Primero creamos un data frame con los valores de prevalencia y luego les agregamos la taxonomía.
+This protects against an OTU with small mean & trivially large C.V.
+```{r}
+# Computamos prevalencia para cada feature y la guardamos en un data frame
+prevdf = apply(X = otu_table(phyloseq_rawdata),
+               MARGIN = ifelse(taxa_are_rows(phyloseq_rawdata), yes = 1, no = 2),
+               FUN = function(x){sum(x > 0)})
+# Le agregamos la taxonomía
+prevdf = data.frame(Prevalence = prevdf,
+                    TotalAbundance = taxa_sums(phyloseq_rawdata),
+                    tax_table(phyloseq_rawdata))
+
+# Seleccionamos las taxa de interés
+ggplot(prevdf, aes(TotalAbundance, Prevalence / nsamples(phyloseq_rawdata),color=Phylum)) +
+  #Agregamos una línea para nuestro umbral
+  geom_hline(yintercept = 0.05, alpha = 0.5, linetype = 2) +  geom_point(size = 2, alpha = 0.7) +
+  scale_x_log10() +  xlab("Total Abundance") + ylab("Prevalence [Frac. Samples]") +
+  facet_wrap(~Phylum) + theme(legend.position="none")
+ggsave(filename = "Analysis_results/05_analysis1/00_plot_prevalence-vs-abundance.tiff")
+```
+
+
+## Filter
+```{r}
+filterPhyla2 <- c("Chloroplast", "Mitochondria", "Eukaryota")
+phyloseq_rawdata <- subset_taxa(phyloseq_rawdata, !Kingdom %in% filterPhyla2)
+phyloseq_rawdata <- subset_taxa(phyloseq_rawdata, !Phylum %in% filterPhyla2)
+phyloseq_rawdata <- subset_taxa(phyloseq_rawdata, !Class %in% filterPhyla2)
+phyloseq_rawdata <- subset_taxa(phyloseq_rawdata, !Order %in% filterPhyla2)
+phyloseq_rawdata <- subset_taxa(phyloseq_rawdata, !Family %in% filterPhyla2)
+phyloseq_rawdata <- subset_taxa(phyloseq_rawdata, !Genus %in% filterPhyla2)
+
+# Definimos el umbral de prevalencia a un 5%
+prevalenceThreshold = 0.05 * nsamples(phyloseq_rawdata)
+# Execute prevalence filter, using `prune_taxa()` function
+keepTaxa = rownames(prevdf)[(prevdf$Prevalence >= prevalenceThreshold)]
+phyloseq_rawdata_filter = prune_taxa(keepTaxa, phyloseq_rawdata)
+
+save(phyloseq_rawdata_filter, file = "Analysis_results/05_analysis1/01_phyloseqobject_rawdata_filtered.Rda")
+```
+
+
+## Exploratory analysis
+### Boxplots
+```{r}
+# raw data
+mydata <- otu_table(phyloseq_rawdata)
+png("Analysis_results/05_analysis1/02_plot_boxplot_rawdata.png", width = 50, height = 15, units = "cm", res = 300)
+boxplot(log(mydata+1), main = paste("Raw data (n =", nrow(mydata), "ASVs)"), las = 2, col = "lightblue")
+dev.off()
+
+# filtering low abundant ASVs by prevalence
+mydata_filtered <- otu_table(phyloseq_rawdata_filter)
+png("Analysis_results/05_analysis1/02_plot_boxplot_filtered.png", width = 50, height = 15, units = "cm", res = 300)
+boxplot(log(mydata_filtered+1), main = paste("Filtered data (n =", nrow(mydata_filtered), "ASVs)"), 
+        las = 2, col = "lightblue")
+dev.off()
+```
+
+
+### Relative abundance bars
+```{r}
+library(fantaxtic)
+# Necesitamos obtener las taxa mas abundantes, en este caso el top 15
+top15 <- get_top_taxa(physeq_obj = phyloseq_rawdata_filter, n = 15, relative = T,
+                      discard_other = T, other_label = "Other")
+# Species
+top15 <- name_taxa(top15, label = "", species = T, other_label = "Other")
+ptop15 <- fantaxtic_bar(top15, color_by = "Genus", label_by = "Species", facet_by = "Group", facet_cols = 2, order_alg = "as.is", other_color = "Grey")
+ptop15
+ggsave(filename = "Analysis_results/05_analysis1/03_bars-genus.png", scale = 1.5, bg = "white")
+ggsave(filename = "Analysis_results/05_analysis1/03_bars-genus_think.png", height = 3, width = 8, bg = "white")
+
+# Genus
+ptop15 <- fantaxtic_bar(top15, color_by = "Family", label_by = "Species", facet_by = "Group", facet_cols = 2, order_alg = "as.is", other_color = "Grey")
+ptop15
+ggsave(filename = "Analysis_results/05_analysis1/03_bars-family.png", height = 12, width = 5, bg = "white")
+
+# Species - mean group
+top15_mean <- aggregate(x = t(otu_table(top15)), by = list(sample_data(top15)$Group), FUN = mean)
+rownames(top15_mean) <- top15_mean$Group.1
+top15_mean <- top15_mean[,-1]
+top15_mean <- t(top15_mean)
+top15_mean_ps <- top15
+top15_mean_ps@otu_table@.Data <- top15_mean
+fake_samples <- data.frame(Group = unique(sample_data(top15_mean_ps)$Group), 
+                           row.names = unique(sample_data(top15_mean_ps)$Group))
+sample_data(top15_mean_ps) <- data.frame(Group = unique(sample_data(top15_mean_ps)$Group), 
+                           row.names = unique(sample_data(top15_mean_ps)$Group))
+##plot
+top15 <- name_taxa(top15_mean_ps)
+fantaxtic_bar(top15, 
+              color_by = "Genus", 
+              label_by = "Species", 
+              order_alg = "as.is", 
+              other_color = "Grey", 
+              bar_width = 0.80, 
+              palette =  c("#ff9da7", "#1f78b4", "#BEBADA", "#FFFFB3",  "#FDB462", "#FB8072", "#ceb085", "#b2df8a", "#80B1D3",  "#8DD3C7", "#b07aa1"))+
+              #opt2: c("#c27ba0", "#1F78B4", "#BEBADA", "#B2DF8A", "#33A02C", "#FB9A99", "#e5c494", "#FDBF6F", "#FF7F00", "#CAB2D6", "#6A3D9A", "#8DD3C7")) +
+                #opt1: c("#FBB4AE", "#B3CDE3", "#BEBADA", "#CCEBC5", "#1F78B4", "#DECBE4", "#FED9A6", "#FFFFCC", "#E5D8BD", "#FDDAEC", "#F2F2F2")) +
+  xlab("") +
+  coord_cartesian(xlim = c(1,4)) +
+  theme(text = element_text(size = 15),
+        axis.text.x = element_text(face="bold", 
+                                   size=12, 
+                                   angle=0, 
+                                   hjust = 0.5))
+
+ggsave(filename = "Analysis_results/05_analysis1/03_bars-genus_mean_newcolor.png", scale = 1, bg = "white", height = 4, width = 10.5)
+
+```
+
+
+## Diversity
+### Alpha-diversity (phyloseq)
+```{r}
+library(ggplot2)
+library(ggpubr)
+metadata <- sample_data(phyloseq_rawdata_filter)
+groups <- unique(metadata$Group)
+pares <- combn(seq_along(groups), 2, simplify = FALSE, FUN = function(i)groups[i])
+mycolors <- c('#e7cc34', '#ff8080', '#addead', '#8babd3') 
+#e7cc34=control
+#ff8080=HFHSD
+#addead=HFHSD+P_faecium
+#8bacd4=HFHSD+P_faecium+GW2580
+
+p1 <- plot_richness(phyloseq_rawdata_filter, color = "Group", x = "Group", 
+              measures = c("Observed", "Chao1", "ACE", "Shannon", 
+                           "Simpson", "InvSimpson", "Fisher")) + 
+  #theme(panel.background = element_rect(fill = "#DFDFDF")) +
+  geom_boxplot(aes(fill = Group), alpha=0.7) +
+  scale_color_manual(values = mycolors) + 
+  scale_fill_manual(values = mycolors) +
+  stat_compare_means(method = "kruskal", label.y = 0, size = 3, show.legend = F) +
+  stat_compare_means(method = "wilcox.test", comparisons = pares, size = 2.5, label = "p.signif")     # Add global Anova p-value
+p1
+ggsave("Analysis_results/05_analysis1/04_alpha-div2.png", width = 30, height = 15, units = "cm")
+
+writexl::write_xlsx(x = p1$data, path = "Analysis_results/05_analysis1/04_alpha-div-data.xlsx")
+
+```
+
+
+### Beta-diversity (phyloseq)
+```{r}
+#unifrac
+set.seed(123)
+ps.unifrac <- ordinate(phyloseq_rawdata_filter, method = 'PCoA', distance = 'unifrac')
+plot_ordination(phyloseq_rawdata_filter, ps.unifrac, color = 'Group', axes = c(1,2)) +
+            scale_color_manual(values = mycolors) + scale_fill_manual(values = mycolors) +
+            geom_point(size = 4) +
+            stat_ellipse(aes(fill = Group), alpha = .2, type = 't', size = 0, geom = 'polygon') +
+            theme_minimal() +
+            labs(color = 'Group', fill = 'Group', title = 'Unifrac')
+
+ggsave(filename = 'Analysis_results/05_analysis1/05_beta-div_unifrac.png', bg = "white")
+
+#weighted unifrac
+ps.wunifrac <- ordinate(phyloseq_rawdata_filter, 
+                       method = 'PCoA', distance = 'unifrac', weighted=TRUE)
+plot_ordination(phyloseq_rawdata_filter, ps.wunifrac, color = 'Group', axes = c(1,2)) +
+            scale_color_manual(values = mycolors) + scale_fill_manual(values = mycolors) +
+            geom_point(size = 4) +
+            stat_ellipse(aes(fill = Group), alpha = .2, type = 't', size = 0, geom = 'polygon') +
+            theme_minimal() +
+            theme(legend.position = "none",
+                  plot.title = element_text(face = 'bold', size = 15, hjust = 0),
+                  text = element_text(size = 20)) +
+            labs(color = 'Group', fill = 'Group', title = 'Weighted Unifrac')
+ggsave(filename = 'Analysis_results/05_analysis1/05_beta-div_weightedunifrac.png', bg = "white",
+       height = 5, width = 5)
+
+#bray-curtis
+ps.bray <- ordinate(phyloseq_rawdata_filter, method = 'PCoA', distance = 'bray')
+plot_ordination(phyloseq_rawdata_filter, ps.bray, color = 'Group', axes = c(1,2)) +
+            scale_color_manual(values = mycolors) + scale_fill_manual(values = mycolors) +
+            geom_point(size = 4) +
+            stat_ellipse(aes(fill = Group), alpha = .2, type = 't', size = 0, geom = 'polygon') +
+            theme_minimal() +
+            labs(title = 'Bray Curtis') 
+ggsave(filename = 'Analysis_results/05_analysis1/05_beta-div_braycurtis.png', bg = "white")
+```
+
+
+## DESeq2
+```{r}
+library(DESeq2)
+
+# load("Analysis_results/05_analysis1/01_phyloseqobject_rawdata_filtered.Rda")
+
+# Transformation of phyloseq object to deseq2 object
+dsq <- phyloseq_to_deseq2(phyloseq_rawdata_filter, ~0+Group)
+
+# Data normalization
+# a. Function for calculating geometric means prior to estimate size factors
+gm_mean <- function(x, na.rm = TRUE){
+    exp(sum(log(x[x > 0]), na.rm = na.rm) / length(x))
+}
+geoMeans <- apply(counts(dsq), 1, gm_mean)
+
+# b. Estimating size factors
+dsq <- estimateSizeFactors(dsq, geoMeans = geoMeans)
+normCounts = counts(dsq, normalized = TRUE)
+# c. Normalization and parametric Wald test to determine differential abundant taxa
+dsq <- DESeq(dsq, test = 'Wald', fitType = 'local')#, minReplicatesForReplace=Inf)
+
+# check outliers
+##boxplot of the Cook’s distances to see if one sample is consistently higher than others 
+boxplot(log10(assays(dsq)[["cooks"]]), range=0, las=2)
+summary(results(dsq, contrast = c('Group', 'HFHSD', 'Control'), alpha = 0.05))
+
+# Results collection (cooksCutoff=F para no eliminar outliers)
+dsq.HFDvsC <- results(dsq, contrast = c('Group', 'HFHSD', 'Control'), cooksCutoff = FALSE, alpha = 0.05)
+dsq.HFD_P_faeciumvsC <- results(dsq, contrast = c('Group', 'HFHSD.P_faecium', 'Control'), cooksCutoff = FALSE, alpha = 0.05)
+dsq.HFD_P_faecium_GWvsC <- results(dsq, contrast = c('Group', 'HFHSD.P_faecium.GW2580', 'Control'), cooksCutoff = FALSE, alpha = 0.05)
+
+dsq.HFD_P_faeciumvsHFD <- results(dsq, contrast = c('Group', 'HFHSD.P_faecium', 'HFHSD'), cooksCutoff = FALSE, alpha = 0.05)
+dsq.HFD_P_faecium_GWvsHFD <- results(dsq, contrast = c('Group', 'HFHSD.P_faecium.GW2580', 'HFHSD'), cooksCutoff = FALSE, alpha = 0.05)
+
+dsq.HFD_P_faecium_GWvsHFD_P_faecium <- results(dsq, contrast = c('Group', 'HFHSD.P_faecium.GW2580', 'HFHSD.P_faecium'), cooksCutoff = FALSE, alpha = 0.05)
+
+# Sorting results tables
+sorted.HFDvsC <- dsq.HFDvsC[base::order(dsq.HFDvsC$padj, na.last = NA), ]
+sorted.HFD_P_faeciumvsC <- dsq.HFD_P_faeciumvsC[base::order(dsq.HFD_P_faeciumvsC$padj, na.last = NA), ]
+sorted.HFD_P_faecium_GWvsC <- dsq.HFD_P_faecium_GWvsC[base::order(dsq.HFD_P_faecium_GWvsC$padj, na.last = NA), ] 
+
+sorted.HFD_P_faeciumvsHFD <- dsq.HFD_P_faeciumvsHFD[base::order(dsq.HFD_P_faeciumvsHFD$padj, na.last = NA), ]
+sorted.HFD_P_faecium_GWvsHFD <- dsq.HFD_P_faecium_GWvsHFD[base::order(dsq.HFD_P_faecium_GWvsHFD$padj, na.last = NA), ]
+
+sorted.HFD_P_faecium_GWvsHFD_P_faecium <- dsq.HFD_P_faecium_GWvsHFD_P_faecium[base::order(dsq.HFD_P_faecium_GWvsHFD_P_faecium$padj, na.last = NA), ]
+
+# The significantly differentially abundant taxa are the ones found in the upper-left and upper-right corners in a volcano plot
+## Add a column to the dataframe to specify if the taxa are significantly abundant for the case or the control (log2FoldChange respectively positive or negative)
+sorted.HFDvsC <- data.frame(sorted.HFDvsC)
+sorted.HFDvsC$diffabundance <- 'NO'
+sorted.HFDvsC$diffabundance[sorted.HFDvsC$log2FoldChange > 0 & sorted.HFDvsC$padj < 0.05] <- 'CASE'
+sorted.HFDvsC$diffabundance[sorted.HFDvsC$log2FoldChange < 0 & sorted.HFDvsC$padj < 0.05] <- 'CONTROL'
+## Volcano plot - GROUP: HFHSDvsControl
+mycolors <- c('#e7cc34', '#ff8080', 'gray')
+names(mycolors) <- c('CONTROL', 'CASE', 'NO')
+### Add a column label containing the names of ASV differentially abundant
+sorted.HFDvsC$label <- NA
+sorted.HFDvsC$label[sorted.HFDvsC$diffabundance != 'NO'] <- rownames(sorted.HFDvsC)[sorted.HFDvsC$diffabundance != 'NO']
+
+library(ggplot2)
+library(ggrepel)
+ggplot(sorted.HFDvsC, 
+       aes(x = log2FoldChange, y = -log10(padj), color = diffabundance, label = label)) +
+       geom_point() +
+       scale_color_manual(values = mycolors) +
+       geom_text_repel() +
+       labs(title = 'HFHSD vs Control', x = 'log2 fold change', y = '-log10 adjusted p-value') +
+       theme_minimal() +
+       theme(legend.position = "none",
+       plot.title = element_text(size = rel(1.5), hjust = 0.5, face = 'bold'),
+                              axis.title = element_text(size = rel(1.25)),
+                              panel.background = element_rect(fill = 'white', color = 'white'),
+                              plot.background = element_rect(fill = 'white'))
+
+ggsave(filename = '06_volcano1_HFHSDvsControl.png', device = 'png', path = 'Analysis_results/05_analysis1')
+
+## Significative p-values taxonomy table
+df.tax <- as.data.frame(phyloseq_rawdata_filter@tax_table)
+df.tax$label <- rownames(df.tax)
+HFDvsC.taxa <- merge(sorted.HFDvsC, df.tax, all.x = TRUE, sort = FALSE)
+write.table(HFDvsC.taxa, 'Analysis_results/05_analysis1/06_table1_HFHSDvsControl_taxonomy.tsv', sep = '\t', row.names = FALSE)
+
+## Same for other groups
+## Volcano plot & tax table - GROUP2: HFD_P_faeciumvsC
+mycolors <- c('#e7cc34', '#addead', 'gray')
+names(mycolors) <- c('CONTROL', 'CASE', 'NO')
+
+sorted.HFD_P_faeciumvsC <- data.frame(sorted.HFD_P_faeciumvsC)
+sorted.HFD_P_faeciumvsC$diffabundance <- 'NO'
+sorted.HFD_P_faeciumvsC$diffabundance[sorted.HFD_P_faeciumvsC$log2FoldChange > 0 & sorted.HFD_P_faeciumvsC$padj < 0.05] <- 'CASE'
+sorted.HFD_P_faeciumvsC$diffabundance[sorted.HFD_P_faeciumvsC$log2FoldChange < 0 & sorted.HFD_P_faeciumvsC$padj < 0.05] <- 'CONTROL'
+sorted.HFD_P_faeciumvsC$label <- NA
+sorted.HFD_P_faeciumvsC$label[sorted.HFD_P_faeciumvsC$diffabundance != 'NO'] <- rownames(sorted.HFD_P_faeciumvsC)[sorted.HFD_P_faeciumvsC$diffabundance != 'NO']
+
+ggplot(sorted.HFD_P_faeciumvsC, aes(x = log2FoldChange, y = -log10(padj), color = diffabundance, label = label)) +
+                        geom_point() +
+                        scale_color_manual(values = mycolors) +
+                        geom_text_repel() +
+                        labs(title = 'HFHSD-P_faecium vs Control', x = 'log2 fold change', y = '-log10 adjusted p-value') +
+                        theme_minimal() +
+                        theme(legend.position = "none",
+                              plot.title = element_text(size = rel(1.5), hjust = 0.5, face = 'bold'),
+                              axis.title = element_text(size = rel(1.25)),
+                              panel.background = element_rect(fill = 'white', color = 'white'),
+                              plot.background = element_rect(fill = 'white'))
+
+ggsave(filename = '06_volcano2_HFHSD-P_faeciumvsControl.png', device = 'png', path = 'Analysis_results/05_analysis1')
+
+HFD_P_faeciumvsC.taxa <- merge(sorted.HFD_P_faeciumvsC, df.tax, all.x = TRUE, sort = FALSE)
+write.table(HFD_P_faeciumvsC.taxa, 'Analysis_results/05_analysis1/06_table2_HFHSD-P_faeciumvsControl_taxonomy.tsv', sep = '\t', row.names = FALSE)
+
+## Volcano plot & tax table - GROUP3: HFD_P_faecium_GWvsC
+mycolors <- c('#e7cc34', '#8babd3', 'gray')
+names(mycolors) <- c('CONTROL', 'CASE', 'NO')
+
+sorted.HFD_P_faecium_GWvsC <- data.frame(sorted.HFD_P_faecium_GWvsC)
+sorted.HFD_P_faecium_GWvsC$diffabundance <- 'NO'
+sorted.HFD_P_faecium_GWvsC$diffabundance[sorted.HFD_P_faecium_GWvsC$log2FoldChange > 0 & sorted.HFD_P_faecium_GWvsC$padj < 0.05] <- 'CASE'
+sorted.HFD_P_faecium_GWvsC$diffabundance[sorted.HFD_P_faecium_GWvsC$log2FoldChange < 0 & sorted.HFD_P_faecium_GWvsC$padj < 0.05] <- 'CONTROL'
+sorted.HFD_P_faecium_GWvsC$label <- NA
+sorted.HFD_P_faecium_GWvsC$label[sorted.HFD_P_faecium_GWvsC$diffabundance != 'NO'] <- rownames(sorted.HFD_P_faecium_GWvsC)[sorted.HFD_P_faecium_GWvsC$diffabundance != 'NO']
+
+ggplot(sorted.HFD_P_faecium_GWvsC, aes(x = log2FoldChange, y = -log10(padj), color = diffabundance, label = label)) +
+                        geom_point() +
+                        scale_color_manual(values = mycolors) +
+                        geom_text_repel() +
+                        labs(title = 'HFHSD-P_faecium-GW2580 vs Control', x = 'log2 fold change', y = '-log10 adjusted p-value') +
+                        theme_minimal() +
+                        theme(legend.position = "none",
+                              plot.title = element_text(size = rel(1.5), hjust = 0.5, face = 'bold'),
+                              axis.title = element_text(size = rel(1.25)),
+                              panel.background = element_rect(fill = 'white', color = 'white'),
+                              plot.background = element_rect(fill = 'white'))
+
+ggsave(filename = '06_volcano3_HFHSD-P_faecium-GW2580vsControl.png', device = 'png', path = 'Analysis_results/05_analysis1')
+
+HFD_P_faecium_GWvsC.taxa <- merge(sorted.HFD_P_faecium_GWvsC, df.tax, all.x = TRUE, sort = FALSE)
+write.table(HFD_P_faecium_GWvsC.taxa, 'Analysis_results/05_analysis1/06_table3_HFHSD-P_faecium-GW2580vsControl_taxonomy.tsv', sep = '\t', row.names = FALSE)
+
+
+## Volcano plot & tax table - GROUP4: HFD_P_faeciumvsHFD
+mycolors <- c('#ff8080', '#addead', 'gray')
+names(mycolors) <- c('CONTROL', 'CASE', 'NO')
+
+sorted.HFD_P_faeciumvsHFD <- data.frame(sorted.HFD_P_faeciumvsHFD)
+sorted.HFD_P_faeciumvsHFD$diffabundance <- 'NO'
+sorted.HFD_P_faeciumvsHFD$diffabundance[sorted.HFD_P_faeciumvsHFD$log2FoldChange > 0 & sorted.HFD_P_faeciumvsHFD$padj < 0.05] <- 'CASE'
+sorted.HFD_P_faeciumvsHFD$diffabundance[sorted.HFD_P_faeciumvsHFD$log2FoldChange < 0 & sorted.HFD_P_faeciumvsHFD$padj < 0.05] <- 'CONTROL'
+sorted.HFD_P_faeciumvsHFD$label <- NA
+sorted.HFD_P_faeciumvsHFD$label[sorted.HFD_P_faeciumvsHFD$diffabundance != 'NO'] <- rownames(sorted.HFD_P_faeciumvsHFD)[sorted.HFD_P_faeciumvsHFD$diffabundance != 'NO']
+
+ggplot(sorted.HFD_P_faeciumvsHFD, aes(x = log2FoldChange, y = -log10(padj), color = diffabundance, label = label)) +
+                        geom_point() +
+                        scale_color_manual(values = mycolors) +
+                        geom_text_repel() +
+                        labs(title = 'HFHSD-P_faecium vs HFHSD', x = 'log2 fold change', y = '-log10 adjusted p-value') +
+                        theme_minimal() +
+                        theme(legend.position = "none",
+                              plot.title = element_text(size = rel(1.5), hjust = 0.5, face = 'bold'),
+                              axis.title = element_text(size = rel(1.25)),
+                              panel.background = element_rect(fill = 'white', color = 'white'),
+                              plot.background = element_rect(fill = 'white'))
+
+ggsave(filename = '06_volcano4_HFHSD-P_faeciumvsHFHSD.png', device = 'png', path = 'Analysis_results/05_analysis1')
+
+HFD_P_faeciumvsHFD.taxa <- merge(sorted.HFD_P_faeciumvsHFD, df.tax, all.x = TRUE, sort = FALSE)
+write.table(HFD_P_faeciumvsHFD.taxa, 'Analysis_results/05_analysis1/06_table4_HFHSD-P_faeciumvsHFHSD_taxonomy.tsv', sep = '\t', row.names = FALSE)
+
+
+## Volcano plot & tax table - GROUP5: HFD_P_faecium_GWvsHFD
+mycolors <- c('#ff8080', '#8babd3', 'gray')
+names(mycolors) <- c('CONTROL', 'CASE', 'NO')
+
+sorted.HFD_P_faecium_GWvsHFD <- data.frame(sorted.HFD_P_faecium_GWvsHFD)
+sorted.HFD_P_faecium_GWvsHFD$diffabundance <- 'NO'
+sorted.HFD_P_faecium_GWvsHFD$diffabundance[sorted.HFD_P_faecium_GWvsHFD$log2FoldChange > 0 & sorted.HFD_P_faecium_GWvsHFD$padj < 0.05] <- 'CASE'
+sorted.HFD_P_faecium_GWvsHFD$diffabundance[sorted.HFD_P_faecium_GWvsHFD$log2FoldChange < 0 & sorted.HFD_P_faecium_GWvsHFD$padj < 0.05] <- 'CONTROL'
+sorted.HFD_P_faecium_GWvsHFD$label <- NA
+sorted.HFD_P_faecium_GWvsHFD$label[sorted.HFD_P_faecium_GWvsHFD$diffabundance != 'NO'] <- rownames(sorted.HFD_P_faecium_GWvsHFD)[sorted.HFD_P_faecium_GWvsHFD$diffabundance != 'NO']
+
+ggplot(sorted.HFD_P_faecium_GWvsHFD, aes(x = log2FoldChange, y = -log10(padj), color = diffabundance, label = label)) +
+                        geom_point() +
+                        scale_color_manual(values = mycolors) +
+                        geom_text_repel() +
+                        labs(title = 'HFHSD-P_faecium-GW2580 vs HFHSD', x = 'log2 fold change', y = '-log10 adjusted p-value') +
+                        theme_minimal() +
+                        theme(legend.position = "none",
+                              plot.title = element_text(size = rel(1.5), hjust = 0.5, face = 'bold'),
+                              axis.title = element_text(size = rel(1.25)),
+                              panel.background = element_rect(fill = 'white', color = 'white'),
+                              plot.background = element_rect(fill = 'white'))
+
+ggsave(filename = '06_volcano5_HFHSD-P_faecium-GW2580vsHFHSD.png', device = 'png', path = 'Analysis_results/05_analysis1')
+
+HFD_P_faecium_GWvsHFD.taxa <- merge(sorted.HFD_P_faecium_GWvsHFD, df.tax, all.x = TRUE, sort = FALSE)
+write.table(HFD_P_faecium_GWvsHFD.taxa, 'Analysis_results/05_analysis1/06_table5_HFHSD-P_faecium-GW2580vsHFHSD_taxonomy.tsv', sep = '\t', row.names = FALSE)
+
+## Volcano plot & tax table - GROUP6: HFD_P_faecium_GWvsHFD_P_faecium
+mycolors <- c('#addead', '#8babd3', 'gray')
+names(mycolors) <- c('CONTROL', 'CASE', 'NO')
+
+sorted.HFD_P_faecium_GWvsHFD_P_faecium <- data.frame(sorted.HFD_P_faecium_GWvsHFD_P_faecium)
+sorted.HFD_P_faecium_GWvsHFD_P_faecium$diffabundance <- 'NO'
+sorted.HFD_P_faecium_GWvsHFD_P_faecium$diffabundance[sorted.HFD_P_faecium_GWvsHFD_P_faecium$log2FoldChange > 0 & sorted.HFD_P_faecium_GWvsHFD_P_faecium$padj < 0.05] <- 'CASE'
+sorted.HFD_P_faecium_GWvsHFD_P_faecium$diffabundance[sorted.HFD_P_faecium_GWvsHFD_P_faecium$log2FoldChange < 0 & sorted.HFD_P_faecium_GWvsHFD_P_faecium$padj < 0.05] <- 'CONTROL'
+sorted.HFD_P_faecium_GWvsHFD_P_faecium$label <- NA
+sorted.HFD_P_faecium_GWvsHFD_P_faecium$label[sorted.HFD_P_faecium_GWvsHFD_P_faecium$diffabundance != 'NO'] <- rownames(sorted.HFD_P_faecium_GWvsHFD_P_faecium)[sorted.HFD_P_faecium_GWvsHFD_P_faecium$diffabundance != 'NO']
+
+ggplot(sorted.HFD_P_faecium_GWvsHFD_P_faecium, aes(x = log2FoldChange, y = -log10(padj), color = diffabundance, label = label)) +
+                        geom_point() +
+                        scale_color_manual(values = mycolors) +
+                        geom_text_repel() +
+                        labs(title = 'HFHSD-P_faecium-GW2580 vs HFHSD-P_faecium', x = 'log2 fold change', y = '-log10 adjusted p-value') +
+                        theme_minimal() +
+                        theme(legend.position = "none",
+                              plot.title = element_text(size = rel(1.5), hjust = 0.5, face = 'bold'),
+                              axis.title = element_text(size = rel(1.25)),
+                              panel.background = element_rect(fill = 'white', color = 'white'),
+                              plot.background = element_rect(fill = 'white'))
+
+ggsave(filename = '06_volcano6_HFHSD-P_faecium-GW2580vsHFHSD-P_faecium.png', device = 'png', path = 'Analysis_results/05_analysis1')
+
+HFD_P_faecium_GWvsHFD_P_faecium.taxa <- merge(sorted.HFD_P_faecium_GWvsHFD_P_faecium, df.tax, all.x = TRUE, sort = FALSE)
+write.table(HFD_P_faecium_GWvsHFD_P_faecium.taxa, 'Analysis_results/05_analysis1/06_table6_HFHSD-P_faecium-GW2580vsHFHSD-P_faecium_taxonomy.tsv', sep = '\t', row.names = FALSE)
+
+```
+
+### barplots
+```{r}
+toptaxa2plot <- 10
+  
+temp = list.files(pattern="*.tsv", path = "Analysis_results/05_analysis1/", full.names = T)
+test_name <- do.call(cbind, strsplit(temp, "_"))[5,]
+
+myfiles = lapply(temp, read.delim)
+myfiles = lapply(myfiles, "[", , c("label", "padj"))
+myfiles = lapply(myfiles, na.omit)
+
+## p-values data.frame
+MyMerge <- function(x, y){
+  df <- merge(x, y, by= "label", all.x= TRUE, all.y= TRUE)
+  return(df)
+}
+
+mypvals <- Reduce(MyMerge, myfiles)
+rownames(mypvals) <- mypvals[,"label"]
+mypvals <- mypvals[,grep(pattern = "padj", x = colnames(mypvals))]
+colnames(mypvals) <- test_name
+
+mypvals_tax <- mypvals
+mypvals_tax$ASV <- rownames(mypvals_tax)
+ASV_taxa <- data.frame(phyloseq_rawdata_filter@tax_table@.Data)
+ASV_taxa$ASV <- rownames(ASV_taxa)
+mypvals_tax <- merge(mypvals_tax, ASV_taxa)
+
+## top taxa
+toptaxa <- names(sort(apply(mypvals,1,function(i){sum(is.na(i))})))[1:toptaxa2plot]
+
+## plots
+mydata <- phyloseq_rawdata@otu_table@.Data
+metadata <- sample_data(phyloseq_rawdata)
+mycolors <- c('#e7cc34', '#ff8080', '#addead', '#8babd3') 
+
+lapply(toptaxa, function(i){
+  x = which(toptaxa == i)
+  mytaxa <- cbind(data.frame(taxa = mydata[i,]), 
+                  sample = factor(metadata$Group))
+  
+  pval_df <- na.omit(t(mypvals[i,,drop=F]))
+  groups_df <- do.call(rbind, strsplit(rownames(pval_df), "vs"))
+  stat.test <- data.frame(group1 = groups_df[,1],
+                          group2 = groups_df[,2], 
+                          p.adj = "*") #pval_df[,1]
+  ggpubr::ggpar(ggpubr::ggbarplot(mytaxa, x = "sample", y = "taxa",
+                          fill = "sample", palette = mycolors,
+                          title = toString(tax_table(phyloseq_rawdata)[i,5:7]),
+                          subtitle = i,
+                          xlab = "Group",
+                          ylab = "abundance value",
+                          add = c("mean_se","jitter"),  add.params = list(group = "sample"),
+                          position = position_dodge(0.8)) +
+                  ggpubr::font("title", size = 10, face = "bold.italic") +
+                  ggpubr::font("subtitle", size = 10, color = "gray") +
+                  ggpubr::stat_pvalue_manual(
+                    stat.test, 
+                    # y.position = max(mytaxa[!controls,]$taxa)+0.5, step.increase = 0.3, #log = T
+                    y.position = max(mytaxa$taxa)*1.2, step.increase = 0.1,
+                    label = "p.adj"))
+
+    ggsave(filename = paste0("Analysis_results/05_analysis1/07_barplot", x, "_", i, ".png"), 
+           width = 8.5, height = 5)
+})
+
+writexl::write_xlsx(mypvals_tax, path = "Analysis_results/05_analysis1/mypvals_model1.xlsx")
+
+```
+
+### EXTRA for article: add mean by group into mypvals_model1.xlsx
+```{r}
+ASV_otutable <- otu_table(phyloseq_rawdata_filter)
+
+m <- sample_data(phyloseq_rawdata_filter)
+mean_tab <- data.frame("mean(Control)" = rowMeans(ASV_otutable[,m$Group == "Control"]),
+                       "mean(HFHSD)" = rowMeans(ASV_otutable[,m$Group == "HFHSD"]),
+                       "mean(HFHSD-P_faecium)" = rowMeans(ASV_otutable[,m$Group == "HFHSD-P_faecium"]),
+                       "mean(HFHSD-P_faecium-GW2580)" = rowMeans(ASV_otutable[,m$Group == "HFHSD-P_faecium-GW2580"]),
+                       check.names = F)
+mean_tab_ft <- mean_tab[mypvals_tax$ASV,]
+
+mypvals_tax_new <- cbind(mean_tab_ft, mypvals_tax)
+writexl::write_xlsx(mypvals_tax_new, path = "Analysis_results/05_analysis1/mypvals_model1_NEW.xlsx")
+```
+
