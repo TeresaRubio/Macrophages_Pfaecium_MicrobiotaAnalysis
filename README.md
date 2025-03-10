@@ -1,1 +1,2 @@
 # Macrophages_Pfaecium_MicrobiotaAnalysis
+This repository contains the bioinformatics analysis pipeline used in the study "Phascolarctobacterium faecium retunes the dialogue between macrophages and group 1 innate lymphoid cells to intercept obesity development in mice." The code documents the steps followed for microbiota data processing, including quality control, taxonomic classification, diversity analysis, and statistical comparisons. It ensures reproducibility and facilitates further exploration of the microbiome dynamics described in the study.
